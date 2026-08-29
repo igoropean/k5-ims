@@ -299,6 +299,15 @@ async function startScanner() {
     }
 
     // Prefer rear/environment camera.
+    // html5-qrcode's own argument validation only accepts `facingMode` as
+    // either a plain string ("environment") or an object with just an
+    // `exact` key ({ exact: "environment" }) — it rejects any other shape,
+    // including the standard MediaTrackConstraints `{ ideal: "environment" }`
+    // form, with "'facingMode' should be string or object with exact as
+    // key." The plain string form below is what the library treats as a
+    // soft preference: it behaves like "ideal" (falls back to another
+    // camera if there's no rear camera) without forcing an exact match.
+    //
     // Keep a handle on this promise on `state` so any other function that
     // wants to stop/clear the scanner (closeScanner, stopScanner) can wait
     // for it to settle first instead of calling stop()/clear() while
@@ -307,9 +316,7 @@ async function startScanner() {
     // transition."
     state.startPromise = state.scanner.start(
       {
-        facingMode: {
-          ideal: "environment",
-        },
+        facingMode: "environment",
       },
       {
         fps: 10,
@@ -413,6 +420,17 @@ async function closeScanner() {
         state.scanner.clear();
       } catch (_) {}
     }
+
+    // Discard the Html5Qrcode instance entirely rather than reusing it for
+    // the next scan session. html5-qrcode tracks its own internal
+    // start/stop transition state on the instance, and reusing the same
+    // instance across open→close→reopen cycles is what triggers "Cannot
+    // transition to a new state, already under transition" the second (or
+    // later) time the scanner is opened — even though stop()/clear() both
+    // completed cleanly. A fresh instance next time guarantees there's no
+    // stale internal state left over from this session.
+    state.scanner = null;
+    state.cameraIndex = 0;
   } catch (err) {
     console.warn("Camera stop:", err);
   } finally {
@@ -441,6 +459,13 @@ async function stopScanner() {
     try {
       state.scanner.clear();
     } catch (_) {}
+
+    // Same reasoning as closeScanner(): always start the next scan session
+    // (the next time the user taps "Scan QR Code") with a brand new
+    // Html5Qrcode instance so no internal transition-state can leak
+    // between sessions.
+    state.scanner = null;
+    state.cameraIndex = 0;
   }
   state.scannerRunning = false;
 }
