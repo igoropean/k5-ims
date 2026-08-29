@@ -9,9 +9,12 @@ const state = {
   history: JSON.parse(localStorage.getItem("k5_history") || "[]"),
   scanner: null,
   scannerRunning: false,
+  scannerStarting: false,
+  scannerStopping: false,
   cameras: [],
   cameraIndex: 0,
   torchOn: false,
+  qrProcessing: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -255,46 +258,75 @@ async function openScanner() {
 }
 
 async function startScanner() {
+  // Prevent start/start race conditions.
+  if (state.scannerRunning || state.scannerStarting) {
+    return;
+  }
+
+  state.scannerStarting = true;
+
   try {
+    if (!window.isSecureContext) {
+      throw new Error("Camera access requires HTTPS.");
+    }
+
     if (!state.scanner) {
       state.scanner = new Html5Qrcode("reader");
     }
 
-    // Prefer the phone's rear/environment camera.
+    // Make sure the reader container is clean before starting.
+    const reader = document.getElementById("reader");
+
+    if (!reader) {
+      throw new Error("Scanner element was not found.");
+    }
+
+    // Prefer rear/environment camera.
     await state.scanner.start(
-      { facingMode: { ideal: "environment" } },
       {
-        fps: 12,
+        facingMode: {
+          ideal: "environment",
+        },
+      },
+      {
+        fps: 10,
+
         qrbox: (viewfinderWidth, viewfinderHeight) => {
           const size = Math.floor(
-            Math.min(viewfinderWidth, viewfinderHeight) * 0.72,
+            Math.min(viewfinderWidth, viewfinderHeight) * 0.7,
           );
-          return { width: size, height: size };
+
+          return {
+            width: size,
+            height: size,
+          };
         },
+
         aspectRatio: 1,
       },
+
+      // QR success
       onQrSuccess,
+
+      // QR scan failure
       () => {},
     );
 
+    // Camera has successfully started.
     state.scannerRunning = true;
 
-    // Discover alternate cameras only after the camera has successfully started.
+    // Only now discover cameras.
     try {
       state.cameras = await Html5Qrcode.getCameras();
-    } catch (_) {
+    } catch (e) {
       state.cameras = [];
     }
 
     updateCameraControls();
   } catch (err) {
+    console.error("Scanner start error:", err);
+
     state.scannerRunning = false;
-
-    try {
-      if (state.scanner) await state.scanner.clear();
-    } catch (_) {}
-
-    scannerModal.hide();
 
     await Swal.fire({
       icon: "error",
@@ -302,12 +334,30 @@ async function startScanner() {
       text: friendlyCameraError(err),
       confirmButtonText: "OK",
     });
+  } finally {
+    state.scannerStarting = false;
   }
 }
 
 async function closeScanner() {
-  await stopScanner();
-  scannerModal.hide();
+  if (state.scannerStopping) {
+    return;
+  }
+
+  state.scannerStopping = true;
+
+  try {
+    if (state.scanner && state.scannerRunning) {
+      await state.scanner.stop();
+    }
+  } catch (err) {
+    console.warn("Camera stop:", err);
+  } finally {
+    state.scannerRunning = false;
+    state.scannerStopping = false;
+
+    scannerModal.hide();
+  }
 }
 
 async function stopScanner() {
@@ -324,45 +374,56 @@ async function stopScanner() {
 }
 
 async function onQrSuccess(decodedText) {
-  await stopScanner();
-  scannerModal.hide();
-
-  const parsed = parseQrPayload(decodedText);
-  if (!parsed) {
-    await Swal.fire({
-      icon: "error",
-      title: "Invalid QR Code",
-      text: "This QR code does not contain the expected 3-line item format.",
-    });
+  if (state.qrProcessing) {
     return;
   }
 
-  const duplicate = state.items.some(
-    (x) => x.inventoryId.toLowerCase() === parsed.inventoryId.toLowerCase(),
-  );
-  if (duplicate) {
-    await Swal.fire({
-      icon: "warning",
-      title: "Duplicate Scan",
-      text: `${parsed.inventoryId} is already in the current IR Slip. The duplicate scan was rejected.`,
-    });
-    return;
+  state.qrProcessing = true;
+
+  try {
+    await stopScanner();
+    scannerModal.hide();
+
+    const parsed = parseQrPayload(decodedText);
+    if (!parsed) {
+      await Swal.fire({
+        icon: "error",
+        title: "Invalid QR Code",
+        text: "This QR code does not contain the expected 3-line item format.",
+      });
+      return;
+    }
+
+    const duplicate = state.items.some(
+      (x) => x.inventoryId.toLowerCase() === parsed.inventoryId.toLowerCase(),
+    );
+    if (duplicate) {
+      await Swal.fire({
+        icon: "warning",
+        title: "Duplicate Scan",
+        text: `${parsed.inventoryId} is already in the current IR Slip. The duplicate scan was rejected.`,
+      });
+      return;
+    }
+
+    state.items.push({ ...parsed, quantity: "" });
+    saveItems();
+    renderItems();
+
+    const card = document.querySelector(
+      `[data-item-id="${cssEscape(parsed.inventoryId)}"]`,
+    );
+    card?.scrollIntoView({ behavior: "smooth", block: "center" });
+
+    setTimeout(() => {
+      card?.querySelector(".qty-input")?.focus();
+    }, 350);
+
+    if (navigator.vibrate) navigator.vibrate([80, 50, 80]);
+    
+  } finally {
+    state.qrProcessing = false;
   }
-
-  state.items.push({ ...parsed, quantity: "" });
-  saveItems();
-  renderItems();
-
-  const card = document.querySelector(
-    `[data-item-id="${cssEscape(parsed.inventoryId)}"]`,
-  );
-  card?.scrollIntoView({ behavior: "smooth", block: "center" });
-
-  setTimeout(() => {
-    card?.querySelector(".qty-input")?.focus();
-  }, 350);
-
-  if (navigator.vibrate) navigator.vibrate([80, 50, 80]);
 }
 
 function parseQrPayload(text) {
@@ -701,44 +762,71 @@ function showHistory() {
 
 async function switchCamera() {
   if (state.cameras.length < 2) {
-    Swal.fire({
+    await Swal.fire({
       icon: "info",
       title: "Only One Camera",
       text: "No alternate camera was detected.",
     });
+
     return;
   }
 
-  await stopScanner();
-  state.cameraIndex = (state.cameraIndex + 1) % state.cameras.length;
+  if (state.scannerStarting || state.scannerStopping || !state.scannerRunning) {
+    return;
+  }
 
   try {
-    if (!state.scanner) state.scanner = new Html5Qrcode("reader");
+    state.scannerStopping = true;
+
+    await state.scanner.stop();
+
+    state.scannerRunning = false;
+    state.scannerStopping = false;
+
+    state.cameraIndex = (state.cameraIndex + 1) % state.cameras.length;
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    state.scannerStarting = true;
 
     await state.scanner.start(
       state.cameras[state.cameraIndex].id,
       {
-        fps: 12,
+        fps: 10,
+
         qrbox: (viewfinderWidth, viewfinderHeight) => {
           const size = Math.floor(
-            Math.min(viewfinderWidth, viewfinderHeight) * 0.72,
+            Math.min(viewfinderWidth, viewfinderHeight) * 0.7,
           );
-          return { width: size, height: size };
+
+          return {
+            width: size,
+            height: size,
+          };
         },
+
         aspectRatio: 1,
       },
+
       onQrSuccess,
+
       () => {},
     );
 
     state.scannerRunning = true;
-    updateCameraControls();
   } catch (err) {
-    Swal.fire({
+    console.error("Camera switch error:", err);
+
+    state.scannerRunning = false;
+
+    await Swal.fire({
       icon: "error",
       title: "Camera Error",
       text: friendlyCameraError(err),
     });
+  } finally {
+    state.scannerStarting = false;
+    state.scannerStopping = false;
   }
 }
 
