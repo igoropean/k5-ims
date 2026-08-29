@@ -15,6 +15,7 @@ const state = {
   cameraIndex: 0,
   torchOn: false,
   qrProcessing: false,
+  pendingStartTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -254,12 +255,27 @@ async function openScanner() {
   }
 
   scannerModal.show();
-  setTimeout(() => startScanner(), 350);
+
+  // Track this so closeScanner() can cancel it if the user closes the
+  // modal before the camera has actually started (see closeScanner).
+  state.pendingStartTimer = setTimeout(() => {
+    state.pendingStartTimer = null;
+    startScanner();
+  }, 350);
 }
 
 async function startScanner() {
   // Prevent start/start race conditions.
   if (state.scannerRunning || state.scannerStarting) {
+    return;
+  }
+
+  // The modal may have been closed while this call was queued (e.g. the
+  // user tapped the X during the opening delay). Starting the camera now
+  // would grab a media stream behind a hidden modal that never gets
+  // released, which blocks every future scan attempt with a "camera busy"
+  // error. Bail out instead.
+  if (!scannerModalEl.classList.contains("show")) {
     return;
   }
 
@@ -340,6 +356,13 @@ async function startScanner() {
 }
 
 async function closeScanner() {
+  // Cancel a still-pending "start the camera after the modal opens" call
+  // so it can never fire once the user has already closed the modal.
+  if (state.pendingStartTimer) {
+    clearTimeout(state.pendingStartTimer);
+    state.pendingStartTimer = null;
+  }
+
   if (state.scannerStopping) {
     return;
   }
@@ -349,6 +372,16 @@ async function closeScanner() {
   try {
     if (state.scanner && state.scannerRunning) {
       await state.scanner.stop();
+    }
+
+    // Tear down the injected video/canvas elements so the #reader
+    // container is clean for the next scan. Without this, reopening the
+    // scanner can leave a stale/frozen video element in place and the
+    // camera feed fails to (re)attach on many Android devices.
+    if (state.scanner) {
+      try {
+        state.scanner.clear();
+      } catch (_) {}
     }
   } catch (err) {
     console.warn("Camera stop:", err);
