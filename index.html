@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b3b91" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="description" content="K5 QR Inventory Scanner" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="assets/icon.svg" type="image/svg+xml" />
+    <title>K5 QR Inventory Scanner</title>
+
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet" />
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"
+      rel="stylesheet" />
+    <link
+      href="https://cdn.jsdelivr.net/npm/sweetalert2@11.15.10/dist/sweetalert2.min.css"
+      rel="stylesheet" />
+    <link rel="stylesheet" href="css/app.css" />
+  </head>
+  <body>
+    <div id="appShell">
+      <!-- LOGIN -->
+      <section id="loginView" class="view active">
+        <div class="login-bg">
+          <div class="login-orb orb-a"></div>
+          <div class="login-orb orb-b"></div>
+
+          <div
+            class="container min-vh-100 d-flex align-items-center justify-content-center py-4">
+            <div class="glass-panel login-card">
+              <div class="brand-lockup text-center mb-4">
+                <img
+                  src="assets/logo.png"
+                  class="login-logo"
+                  alt="K5 - Tech Business Solutions" />
+
+                <div>
+                  <div class="brand-name">Tech Business Solutions</div>
+                  <div class="brand-subtitle">Inventory Management System</div>
+                </div>
+              </div>
+
+              <div class="welcome-copy text-center mb-4">
+                <h1>Welcome Back!</h1>
+                <p>Please login to continue</p>
+              </div>
+
+              <form id="loginForm" novalidate>
+                <div class="input-group-modern mb-3">
+                  <i class="bi bi-person"></i>
+                  <input
+                    id="username"
+                    class="form-control"
+                    autocomplete="username"
+                    placeholder="Username"
+                    required />
+                </div>
+
+                <div class="input-group-modern mb-3">
+                  <i class="bi bi-lock"></i>
+                  <input
+                    id="password"
+                    type="password"
+                    class="form-control"
+                    autocomplete="current-password"
+                    placeholder="Password"
+                    required />
+                  <button
+                    type="button"
+                    class="password-toggle"
+                    id="togglePassword"
+                    aria-label="Show password">
+                    <i class="bi bi-eye"></i>
+                  </button>
+                </div>
+
+                <div class="form-check mb-4">
+                  <input
+                    class="form-check-input"
+                    type="checkbox"
+                    id="rememberMe" />
+                  <label class="form-check-label" for="rememberMe"
+                    >Remember me on this device</label
+                  >
+                </div>
+
+                <button
+                  class="btn btn-primary-modern w-100"
+                  id="loginBtn"
+                  type="submit">
+                  <i class="bi bi-box-arrow-in-right me-2"></i>Login
+                </button>
+              </form>
+
+              <div class="text-center small text-muted mt-4">
+                © K5 - Tech Business Solutions
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SCANNER -->
+      <section id="scannerView" class="view">
+        <header class="app-header glass-panel">
+          <div class="d-flex align-items-center gap-2">
+            <img src="assets/logo.png" class="header-logo" alt="K5" />
+
+            <div>
+              <div class="app-title">QR Stock Scanner</div>
+              <div class="app-user" id="headerUser">Not logged in</div>
+            </div>
+          </div>
+
+          <button class="icon-btn" id="logoutBtn" title="Logout">
+            <i class="bi bi-box-arrow-right"></i>
+          </button>
+        </header>
+
+        <main class="container app-container pb-safe">
+          <div class="slip-card glass-panel">
+            <div class="section-label">Transaction Type</div>
+            <div
+              class="transaction-toggle"
+              role="group"
+              aria-label="Transaction Type">
+              <button
+                type="button"
+                class="transaction-option active"
+                data-transaction="IR_ISSUE">
+                <i class="bi bi-box-arrow-up"></i>
+                <span>IR Issue</span>
+              </button>
+              <button
+                type="button"
+                class="transaction-option"
+                data-transaction="IR_RETURN">
+                <i class="bi bi-box-arrow-down"></i>
+                <span>IR Return</span>
+              </button>
+              <button
+                type="button"
+                class="transaction-option"
+                data-transaction="GOODS_RECEIVED">
+                <i class="bi bi-box-seam"></i>
+                <span>Goods Received</span>
+              </button>
+            </div>
+
+            <div class="section-label mt-3" id="referenceLabel">
+              IR Slip Number
+            </div>
+            <div class="slip-row">
+              <div class="slip-input-wrap">
+                <i class="bi bi-receipt"></i>
+                <input
+                  id="referenceNumber"
+                  class="form-control"
+                  placeholder="Enter IR Slip Number"
+                  maxlength="80"
+                  autocomplete="off" />
+                <button
+                  class="edit-slip"
+                  id="clearReference"
+                  title="Clear reference number">
+                  <i class="bi bi-x-lg"></i>
+                </button>
+              </div>
+            </div>
+
+            <button class="scan-btn w-100 mt-3" id="scanBtn">
+              <span class="scan-icon"><i class="bi bi-qr-code-scan"></i></span>
+              <span>
+                <strong>Scan QR Code</strong>
+                <small>Tap to start scanning</small>
+              </span>
+            </button>
+          </div>
+
+          <div class="list-heading">
+            <div>
+              <h2>
+                Scanned Items <span class="count-badge" id="itemCount">0</span>
+              </h2>
+              <p>Review quantities before submitting.</p>
+            </div>
+            <button class="text-btn danger" id="clearAllBtn" disabled>
+              <i class="bi bi-trash3 me-1"></i>Clear All
+            </button>
+          </div>
+
+          <div id="itemsList" class="items-list">
+            <div id="emptyState" class="empty-state glass-panel">
+              <div class="empty-icon"><i class="bi bi-qr-code"></i></div>
+              <h3>No items scanned yet</h3>
+              <p id="emptyStateText">
+                Enter the IR Slip number, then tap
+                <strong>Scan QR Code</strong>.
+              </p>
+            </div>
+          </div>
+
+          <div class="summary-card glass-panel">
+            <div>
+              <i class="bi bi-grid-3x3-gap"></i><span>Total Items</span
+              ><strong id="totalItems">0</strong>
+            </div>
+            <div>
+              <i class="bi bi-calculator"></i><span>Total Quantity</span
+              ><strong id="totalQty">0.00</strong>
+            </div>
+          </div>
+
+          <button class="submit-btn w-100" id="submitBtn" disabled>
+            <i class="bi bi-send me-2"></i
+            ><span id="submitLabel">Submit IR Issue</span>
+          </button>
+        </main>
+
+        <nav class="bottom-nav glass-panel">
+          <button class="nav-item active" type="button">
+            <i class="bi bi-qr-code-scan"></i><span>Scan</span>
+          </button>
+          <button class="nav-item" type="button" id="historyBtn">
+            <i class="bi bi-clock-history"></i><span>History</span>
+          </button>
+          <button class="nav-item" type="button" id="bottomLogoutBtn">
+            <i class="bi bi-box-arrow-right"></i><span>Logout</span>
+          </button>
+        </nav>
+      </section>
+
+      <!-- SCAN MODAL -->
+      <div
+        class="modal fade"
+        id="scannerModal"
+        tabindex="-1"
+        aria-hidden="true">
+        <div class="modal-dialog modal-fullscreen">
+          <div class="modal-content scanner-modal-content">
+            <div class="scanner-modal-header">
+              <div>
+                <h2>Scan QR Code</h2>
+                <small>Align the QR code inside the frame</small>
+              </div>
+              <button class="scanner-close" id="closeScannerBtn" type="button">
+                <i class="bi bi-x-lg"></i>
+              </button>
+            </div>
+
+            <div class="scanner-stage">
+              <div id="reader"></div>
+              <div class="scan-overlay">
+                <div class="corner c1"></div>
+                <div class="corner c2"></div>
+                <div class="corner c3"></div>
+                <div class="corner c4"></div>
+                <div class="scan-line"></div>
+              </div>
+              <div class="scan-hint">
+                Place the complete QR code inside the frame
+              </div>
+            </div>
+
+            <div class="scanner-controls">
+              <button class="camera-control" id="torchBtn" type="button">
+                <i class="bi bi-lightbulb"></i><span>Light</span>
+              </button>
+              <button class="torch-main" id="torchMainBtn" type="button">
+                <i class="bi bi-lightning-charge"></i> Flash
+              </button>
+              <button
+                class="camera-control"
+                id="switchCameraBtn"
+                type="button"
+                style="visibility: hidden">
+                <i class="bi bi-camera-reverse"></i><span>Switch</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- HISTORY MODAL -->
+      <div
+        class="modal fade"
+        id="historyModal"
+        tabindex="-1"
+        aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+          <div class="modal-content modern-modal">
+            <div class="modal-header border-0">
+              <h5 class="modal-title">
+                <i class="bi bi-clock-history me-2"></i>Recent Submissions
+              </h5>
+              <button
+                type="button"
+                class="btn-close"
+                data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="historyList"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11.15.10/dist/sweetalert2.all.min.js"></script>
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script src="js/app.js"></script>
+    <script src="js/register-sw.js"></script>
+  </body>
+</html>
