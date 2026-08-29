@@ -1,4 +1,4 @@
-const CACHE_NAME = 'k5-scanner-v3';
+const CACHE_NAME = 'k5-scanner-v4';
 const APP_SHELL = [
   './',
   './index.html',
