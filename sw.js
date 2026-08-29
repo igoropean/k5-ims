@@ -1,11 +1,14 @@
-const CACHE_NAME = 'k5-scanner-v2';
+const CACHE_NAME = 'k5-scanner-v3';
 const APP_SHELL = [
   './',
   './index.html',
   './css/app.css',
   './js/app.js',
+  './js/register-sw.js',
   './manifest.webmanifest',
-  './assets/icon.svg'
+  './assets/logo.png',
+  './assets/icon-192.png',
+  './assets/icon-512.png'
 ];
 
 self.addEventListener('install', event => {
