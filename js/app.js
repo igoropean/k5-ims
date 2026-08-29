@@ -16,6 +16,7 @@ const state = {
   torchOn: false,
   qrProcessing: false,
   pendingStartTimer: null,
+  startPromise: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -298,7 +299,13 @@ async function startScanner() {
     }
 
     // Prefer rear/environment camera.
-    await state.scanner.start(
+    // Keep a handle on this promise on `state` so any other function that
+    // wants to stop/clear the scanner (closeScanner, stopScanner) can wait
+    // for it to settle first instead of calling stop()/clear() while
+    // html5-qrcode is still mid-transition from this start() call — doing
+    // so is what throws "Cannot transition to a new state, already under
+    // transition."
+    state.startPromise = state.scanner.start(
       {
         facingMode: {
           ideal: "environment",
@@ -328,6 +335,8 @@ async function startScanner() {
       () => {},
     );
 
+    await state.startPromise;
+
     // Camera has successfully started.
     state.scannerRunning = true;
 
@@ -344,14 +353,20 @@ async function startScanner() {
 
     state.scannerRunning = false;
 
-    await Swal.fire({
-      icon: "error",
-      title: "Camera Error",
-      text: friendlyCameraError(err),
-      confirmButtonText: "OK",
-    });
+    // Don't show the error dialog (or leave the scanner instance in a
+    // broken state) if the user already closed the modal — closeScanner()
+    // is already awaiting this same promise and will handle cleanup.
+    if (scannerModalEl.classList.contains("show")) {
+      await Swal.fire({
+        icon: "error",
+        title: "Camera Error",
+        text: friendlyCameraError(err),
+        confirmButtonText: "OK",
+      });
+    }
   } finally {
     state.scannerStarting = false;
+    state.startPromise = null;
   }
 }
 
@@ -370,6 +385,21 @@ async function closeScanner() {
   state.scannerStopping = true;
 
   try {
+    // If a start() call is still in flight (the user closed the modal
+    // while the camera was still initializing), wait for it to settle
+    // before doing anything else. Calling stop() or clear() while
+    // html5-qrcode is still mid-transition from an in-progress start()
+    // throws "Cannot transition to a new state, already under transition"
+    // — and can leave that original start() promise (and the camera
+    // stream it opened) dangling, breaking every future scan attempt.
+    if (state.startPromise) {
+      try {
+        await state.startPromise;
+      } catch (_) {
+        // start() failed on its own — nothing further to tear down.
+      }
+    }
+
     if (state.scanner && state.scannerRunning) {
       await state.scanner.stop();
     }
@@ -395,6 +425,15 @@ async function closeScanner() {
 
 async function stopScanner() {
   state.torchOn = false;
+
+  // Same reasoning as in closeScanner(): never stop()/clear() while a
+  // start() transition is still in flight.
+  if (state.startPromise) {
+    try {
+      await state.startPromise;
+    } catch (_) {}
+  }
+
   if (state.scanner && state.scannerRunning) {
     try {
       await state.scanner.stop();
