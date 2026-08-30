@@ -17,6 +17,11 @@ const state = {
   qrProcessing: false,
   pendingStartTimer: null,
   startPromise: null,
+  cameraReady: false,
+  restartingCamera: false,
+  watchdogInterval: null,
+  watchdogLastTime: -1,
+  watchdogStaleCount: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -256,6 +261,7 @@ async function openScanner() {
   }
 
   scannerModal.show();
+  showScannerStatus("Starting camera…");
 
   // Track this so closeScanner() can cancel it if the user closes the
   // modal before the camera has actually started (see closeScanner).
@@ -263,6 +269,134 @@ async function openScanner() {
     state.pendingStartTimer = null;
     startScanner();
   }, 350);
+}
+
+function showScannerStatus(text) {
+  const overlay = $("scannerStatusOverlay");
+  if (!overlay) return;
+  $("scannerStatusText").textContent = text;
+  overlay.classList.add("active");
+}
+
+function hideScannerStatus() {
+  $("scannerStatusOverlay")?.classList.remove("active");
+}
+
+/**
+ * Resolves once the injected <video> element inside #reader is actually
+ * delivering real frames (readyState + a decoded videoWidth), rather than
+ * just once getUserMedia/start() has resolved. On many Android devices
+ * start() resolves well before the stream is visually ready, which is
+ * what caused the scanner to briefly show a black frame — or, worse, let
+ * a decode attempt run against a not-yet-rendered frame. Also resolves
+ * (with false) after a timeout so a slow-to-warm-up camera never leaves
+ * the status overlay stuck forever.
+ */
+function waitForCameraFrames(timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+
+    function check() {
+      if (!state.scannerRunning) {
+        resolve(false);
+        return;
+      }
+
+      const video = document.querySelector("#reader video");
+
+      if (video && video.readyState >= 2 && video.videoWidth > 0) {
+        resolve(true);
+        return;
+      }
+
+      if (Date.now() - startedAt > timeoutMs) {
+        resolve(false);
+        return;
+      }
+
+      requestAnimationFrame(check);
+    }
+
+    check();
+  });
+}
+
+function stopFreezeWatchdog() {
+  if (state.watchdogInterval) {
+    clearInterval(state.watchdogInterval);
+    state.watchdogInterval = null;
+  }
+}
+
+/**
+ * Some Android camera stacks silently stop delivering new frames while
+ * the MediaStream track itself still reports as "live" — the preview
+ * just freezes even though html5-qrcode has no idea anything is wrong.
+ * This periodically checks whether the video's playback position is
+ * actually advancing and, if it's been stuck for a few checks in a row,
+ * silently tears down and re-acquires the camera rather than leaving the
+ * user stuck on a frozen frame.
+ */
+function startFreezeWatchdog() {
+  stopFreezeWatchdog();
+
+  state.watchdogLastTime = -1;
+  state.watchdogStaleCount = 0;
+
+  state.watchdogInterval = setInterval(() => {
+    if (!state.scannerRunning || state.restartingCamera) return;
+    if (document.visibilityState !== "visible") return;
+
+    const video = document.querySelector("#reader video");
+    if (!video) return;
+
+    const t = video.currentTime;
+
+    if (t === state.watchdogLastTime) {
+      state.watchdogStaleCount += 1;
+    } else {
+      state.watchdogStaleCount = 0;
+    }
+
+    state.watchdogLastTime = t;
+
+    // No advancement across ~2 checks (roughly 5 seconds) — treat it as a
+    // frozen stream and recover.
+    if (state.watchdogStaleCount >= 2) {
+      state.watchdogStaleCount = 0;
+      recoverFrozenCamera();
+    }
+  }, 2500);
+}
+
+async function recoverFrozenCamera() {
+  if (state.restartingCamera || !scannerModalEl.classList.contains("show")) {
+    return;
+  }
+
+  state.restartingCamera = true;
+  stopFreezeWatchdog();
+  showScannerStatus("Reconnecting camera…");
+
+  try {
+    if (state.scanner) {
+      try {
+        await state.scanner.stop();
+      } catch (_) {}
+      try {
+        state.scanner.clear();
+      } catch (_) {}
+    }
+
+    state.scanner = null;
+    state.scannerRunning = false;
+    state.cameraReady = false;
+    state.cameraIndex = 0;
+
+    await startScanner();
+  } finally {
+    state.restartingCamera = false;
+  }
 }
 
 async function startScanner() {
@@ -281,6 +415,9 @@ async function startScanner() {
   }
 
   state.scannerStarting = true;
+  showScannerStatus(
+    state.restartingCamera ? "Reconnecting camera…" : "Starting camera…",
+  );
 
   try {
     if (!window.isSecureContext) {
@@ -314,6 +451,13 @@ async function startScanner() {
     // html5-qrcode is still mid-transition from this start() call — doing
     // so is what throws "Cannot transition to a new state, already under
     // transition."
+    //
+    // Note: no `aspectRatio` constraint here anymore. Forcing a
+    // non-native aspect ratio (like the previous 1:1) makes some Android
+    // camera pipelines hand back a corrupted/greenish frame. The video
+    // element is already forced to fill and crop to a square via CSS
+    // (`object-fit: cover`), so dropping this has no visual effect and
+    // removes a likely cause of the green-screen glitches.
     state.startPromise = state.scanner.start(
       {
         facingMode: "environment",
@@ -331,8 +475,6 @@ async function startScanner() {
             height: size,
           };
         },
-
-        aspectRatio: 1,
       },
 
       // QR success
@@ -344,8 +486,13 @@ async function startScanner() {
 
     await state.startPromise;
 
-    // Camera has successfully started.
+    // getUserMedia/start() resolving only means the camera negotiation
+    // succeeded — on many Android devices the video element isn't
+    // actually painting real frames yet at this point, which is what
+    // produced the black-screen flash. Keep state.cameraReady false and
+    // the status overlay up until frames are confirmed.
     state.scannerRunning = true;
+    state.cameraReady = false;
 
     // Only now discover cameras.
     try {
@@ -355,10 +502,18 @@ async function startScanner() {
     }
 
     updateCameraControls();
+
+    await waitForCameraFrames();
+    state.cameraReady = true;
+    hideScannerStatus();
+    startFreezeWatchdog();
   } catch (err) {
     console.error("Scanner start error:", err);
 
     state.scannerRunning = false;
+    state.cameraReady = false;
+    stopFreezeWatchdog();
+    hideScannerStatus();
 
     // Don't show the error dialog (or leave the scanner instance in a
     // broken state) if the user already closed the modal — closeScanner()
@@ -390,6 +545,7 @@ async function closeScanner() {
   }
 
   state.scannerStopping = true;
+  stopFreezeWatchdog();
 
   try {
     // If a start() call is still in flight (the user closed the modal
@@ -436,6 +592,8 @@ async function closeScanner() {
   } finally {
     state.scannerRunning = false;
     state.scannerStopping = false;
+    state.cameraReady = false;
+    hideScannerStatus();
 
     scannerModal.hide();
   }
@@ -443,6 +601,8 @@ async function closeScanner() {
 
 async function stopScanner() {
   state.torchOn = false;
+  stopFreezeWatchdog();
+  state.cameraReady = false;
 
   // Same reasoning as in closeScanner(): never stop()/clear() while a
   // start() transition is still in flight.
@@ -471,6 +631,13 @@ async function stopScanner() {
 }
 
 async function onQrSuccess(decodedText) {
+  // Ignore any decode that fires before we've confirmed the camera is
+  // actually delivering real frames (see waitForCameraFrames). This is a
+  // safety net against decoding a stale/corrupted warm-up frame.
+  if (!state.cameraReady) {
+    return;
+  }
+
   if (state.qrProcessing) {
     return;
   }
@@ -503,7 +670,7 @@ async function onQrSuccess(decodedText) {
       return;
     }
 
-    state.items.push({ ...parsed, quantity: "" });
+    state.items.push({ ...parsed, quantity: "", remarks: "" });
     saveItems();
     renderItems();
 
@@ -572,6 +739,15 @@ function renderItems() {
             <span class="qty-unit">${escapeHtml(item.unit)}</span>
           </div>
         </div>
+        <div class="remarks-row">
+          <span class="qty-label">Remarks</span>
+          <div class="remarks-wrap">
+            <textarea class="remarks-input" rows="2" maxlength="500"
+              placeholder="Optional notes..."
+              data-remarks="${index}"
+              aria-label="Remarks for ${escapeAttr(item.description)}">${escapeHtml(item.remarks || "")}</textarea>
+          </div>
+        </div>
       `;
       list.appendChild(card);
     });
@@ -588,6 +764,13 @@ function renderItems() {
         state.items[i].quantity = input.value;
         saveItems();
         updateSummary();
+      });
+    });
+    list.querySelectorAll("[data-remarks]").forEach((textarea) => {
+      textarea.addEventListener("input", () => {
+        const i = Number(textarea.dataset.remarks);
+        state.items[i].remarks = textarea.value;
+        saveItems();
       });
     });
   }
@@ -711,6 +894,7 @@ async function reviewAndSubmit() {
           <div class="small text-primary fw-bold">${i + 1}. ${escapeHtml(x.inventoryId)}</div>
           <div class="fw-bold">${escapeHtml(x.description)}</div>
           <div class="small text-muted">Unit: ${escapeHtml(x.unit)} · Qty: <strong>${Number(x.quantity).toFixed(2)}</strong></div>
+          ${x.remarks ? `<div class="small text-muted mt-1">Remarks: ${escapeHtml(x.remarks)}</div>` : ""}
         </div>
       `,
         )
@@ -762,6 +946,7 @@ async function submitRecords(referenceNumber) {
         description: x.description,
         unit: x.unit,
         quantity: Number(x.quantity),
+        remarks: x.remarks || "",
       })),
     });
 
@@ -874,6 +1059,9 @@ async function switchCamera() {
 
   try {
     state.scannerStopping = true;
+    stopFreezeWatchdog();
+    state.cameraReady = false;
+    showScannerStatus("Switching camera…");
 
     await state.scanner.stop();
 
@@ -886,6 +1074,10 @@ async function switchCamera() {
 
     state.scannerStarting = true;
 
+    // No `aspectRatio` here either — see the matching note in
+    // startScanner() for why forcing one caused corrupted/green frames on
+    // some devices. The video element is still cropped to a square
+    // visually via CSS regardless.
     await state.scanner.start(
       state.cameras[state.cameraIndex].id,
       {
@@ -901,8 +1093,6 @@ async function switchCamera() {
             height: size,
           };
         },
-
-        aspectRatio: 1,
       },
 
       onQrSuccess,
@@ -911,10 +1101,17 @@ async function switchCamera() {
     );
 
     state.scannerRunning = true;
+
+    await waitForCameraFrames();
+    state.cameraReady = true;
+    hideScannerStatus();
+    startFreezeWatchdog();
   } catch (err) {
     console.error("Camera switch error:", err);
 
     state.scannerRunning = false;
+    state.cameraReady = false;
+    hideScannerStatus();
 
     await Swal.fire({
       icon: "error",
