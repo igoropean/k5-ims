@@ -496,6 +496,39 @@ button {
   color: var(--muted);
 }
 
+.remarks-row {
+  margin-top: 9px;
+  display: flex;
+  gap: 8px;
+}
+.remarks-row .qty-label {
+  margin-top: 9px;
+}
+.remarks-wrap {
+  flex: 1;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #fff;
+  overflow: hidden;
+}
+.remarks-input {
+  display: block;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  resize: vertical;
+  min-height: 44px;
+  max-height: 160px;
+  padding: 9px 10px;
+  font-weight: 600;
+  color: var(--ink);
+  background: transparent;
+}
+.remarks-input::placeholder {
+  color: var(--muted);
+  font-weight: 500;
+}
+
 .summary-card {
   border-radius: 17px;
   padding: 12px 14px;
@@ -675,6 +708,43 @@ button {
   padding: 8px 14px;
   border-radius: 999px;
   font-size: 10px;
+}
+
+/* Shown over the live camera feed until real frames are confirmed
+   flowing (or while silently reconnecting after a frozen stream), so the
+   user never has to look at a black/corrupted warm-up frame. */
+.scanner-status-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: #07111f;
+}
+.scanner-status-overlay.active {
+  display: flex;
+}
+.scanner-spinner {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.18);
+  border-top-color: var(--red-400);
+  animation: scanner-spin 0.85s linear infinite;
+}
+@keyframes scanner-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.scanner-status-text {
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  opacity: 0.9;
 }
 .scanner-controls {
   min-height: 94px;
