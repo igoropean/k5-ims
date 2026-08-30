@@ -22,6 +22,7 @@ const state = {
   watchdogInterval: null,
   watchdogLastTime: -1,
   watchdogStaleCount: 0,
+  watchdogGreenCount: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -49,8 +50,6 @@ function bindEvents() {
   $("togglePassword").addEventListener("click", togglePassword);
   $("scanBtn").addEventListener("click", openScanner);
   $("closeScannerBtn").addEventListener("click", closeScanner);
-  $("switchCameraBtn").addEventListener("click", switchCamera);
-  $("torchBtn").addEventListener("click", toggleTorch);
   $("torchMainBtn").addEventListener("click", toggleTorch);
   $("submitBtn").addEventListener("click", reviewAndSubmit);
   $("clearAllBtn").addEventListener("click", clearAll);
@@ -283,14 +282,61 @@ function hideScannerStatus() {
 }
 
 /**
+ * Downsamples the current video frame onto a tiny offscreen canvas and
+ * checks whether it's overwhelmingly green — the visual signature of the
+ * "green screen" camera corruption some Android devices produce. Used
+ * both to hold the startup overlay a little longer if the very first
+ * frames come in corrupted, and by the freeze watchdog to catch a feed
+ * that's technically still advancing but visually broken.
+ */
+function sampleFrameIsGreenish(video) {
+  try {
+    const w = 12;
+    const h = 12;
+
+    if (!state.sampleCanvas) {
+      state.sampleCanvas = document.createElement("canvas");
+      state.sampleCanvas.width = w;
+      state.sampleCanvas.height = h;
+    }
+
+    const ctx = state.sampleCanvas.getContext("2d", {
+      willReadFrequently: true,
+    });
+    ctx.drawImage(video, 0, 0, w, h);
+
+    const { data } = ctx.getImageData(0, 0, w, h);
+    let rSum = 0;
+    let gSum = 0;
+    let bSum = 0;
+    const n = data.length / 4;
+
+    for (let i = 0; i < data.length; i += 4) {
+      rSum += data[i];
+      gSum += data[i + 1];
+      bSum += data[i + 2];
+    }
+
+    const r = rSum / n;
+    const g = gSum / n;
+    const b = bSum / n;
+
+    return g > 60 && g > r * 1.6 && g > b * 1.6;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
  * Resolves once the injected <video> element inside #reader is actually
- * delivering real frames (readyState + a decoded videoWidth), rather than
- * just once getUserMedia/start() has resolved. On many Android devices
- * start() resolves well before the stream is visually ready, which is
- * what caused the scanner to briefly show a black frame — or, worse, let
- * a decode attempt run against a not-yet-rendered frame. Also resolves
- * (with false) after a timeout so a slow-to-warm-up camera never leaves
- * the status overlay stuck forever.
+ * delivering real, non-corrupted frames, rather than just once
+ * getUserMedia/start() has resolved. On many Android devices start()
+ * resolves well before the stream is visually ready — or briefly hands
+ * back a garbled greenish frame while the sensor settles — which is what
+ * caused the scanner to flash black or green before this fix. Always
+ * resolves within timeoutMs so a slow-to-warm-up camera never leaves the
+ * status overlay stuck forever; the ongoing watchdog takes over from
+ * there if the feed genuinely never recovers.
  */
 function waitForCameraFrames(timeoutMs = 4000) {
   return new Promise((resolve) => {
@@ -303,14 +349,15 @@ function waitForCameraFrames(timeoutMs = 4000) {
       }
 
       const video = document.querySelector("#reader video");
+      const timedOut = Date.now() - startedAt > timeoutMs;
 
       if (video && video.readyState >= 2 && video.videoWidth > 0) {
+        if (timedOut || !sampleFrameIsGreenish(video)) {
+          resolve(true);
+          return;
+        }
+      } else if (timedOut) {
         resolve(true);
-        return;
-      }
-
-      if (Date.now() - startedAt > timeoutMs) {
-        resolve(false);
         return;
       }
 
@@ -329,19 +376,20 @@ function stopFreezeWatchdog() {
 }
 
 /**
- * Some Android camera stacks silently stop delivering new frames while
- * the MediaStream track itself still reports as "live" — the preview
- * just freezes even though html5-qrcode has no idea anything is wrong.
- * This periodically checks whether the video's playback position is
- * actually advancing and, if it's been stuck for a few checks in a row,
- * silently tears down and re-acquires the camera rather than leaving the
- * user stuck on a frozen frame.
+ * Some Android camera stacks silently stop delivering new frames — or
+ * start delivering a corrupted greenish frame — while the MediaStream
+ * track itself still reports as "live"; html5-qrcode has no idea
+ * anything is wrong. This periodically checks whether the video's
+ * playback position is actually advancing, and samples its color, and
+ * if either looks broken for a couple of checks in a row, silently
+ * recovers rather than leaving the user stuck.
  */
 function startFreezeWatchdog() {
   stopFreezeWatchdog();
 
   state.watchdogLastTime = -1;
   state.watchdogStaleCount = 0;
+  state.watchdogGreenCount = 0;
 
   state.watchdogInterval = setInterval(() => {
     if (!state.scannerRunning || state.restartingCamera) return;
@@ -357,13 +405,22 @@ function startFreezeWatchdog() {
     } else {
       state.watchdogStaleCount = 0;
     }
-
     state.watchdogLastTime = t;
 
-    // No advancement across ~2 checks (roughly 5 seconds) — treat it as a
-    // frozen stream and recover.
-    if (state.watchdogStaleCount >= 2) {
+    if (sampleFrameIsGreenish(video)) {
+      state.watchdogGreenCount += 1;
+    } else {
+      state.watchdogGreenCount = 0;
+    }
+
+    // No advancement across ~2 checks (roughly 5 seconds), or a
+    // sustained green/corrupted frame across ~3 checks (roughly 7.5
+    // seconds — deliberately a bit more patient, so briefly pointing the
+    // camera at something genuinely green in the item doesn't trip it) —
+    // treat it as a broken stream and recover.
+    if (state.watchdogStaleCount >= 2 || state.watchdogGreenCount >= 3) {
       state.watchdogStaleCount = 0;
+      state.watchdogGreenCount = 0;
       recoverFrozenCamera();
     }
   }, 2500);
@@ -391,15 +448,92 @@ async function recoverFrozenCamera() {
     state.scanner = null;
     state.scannerRunning = false;
     state.cameraReady = false;
-    state.cameraIndex = 0;
 
-    await startScanner();
+    // Cycle to the next candidate camera rather than restarting the exact
+    // one that was just stuck/corrupted, and rather than falling back to
+    // the "known good" camera saved in localStorage (which may well be
+    // this same one, if it usually works fine but is glitching this
+    // particular session). If nothing is enumerated yet, startScanner()
+    // will fall back to its own resolution logic.
+    let forcedId = null;
+    if (state.cameras.length) {
+      state.cameraIndex = (state.cameraIndex + 1) % state.cameras.length;
+      forcedId = state.cameras[state.cameraIndex].id;
+    }
+
+    await startScanner(forcedId);
   } finally {
     state.restartingCamera = false;
   }
 }
 
-async function startScanner() {
+/**
+ * Ranks enumerated cameras so the "best" rear/main lens sorts first.
+ * Many modern phones expose several rear-facing camera entries (main,
+ * ultra-wide, telephoto, macro, depth) — `facingMode: "environment"`
+ * leaves the choice among these entirely up to the browser, and on some
+ * devices that pick turns out to be an auxiliary lens with no autofocus
+ * tuned for close-up barcode reading and no flash pairing, which is
+ * consistent with green/frozen frames and a non-working flash all
+ * clearing up together once a different (device-ID-selected) camera is
+ * used. This label-based heuristic tries to land on the correct one
+ * automatically instead of requiring a manual camera switcher.
+ */
+function rankCameras(cameras) {
+  const score = (cam) => {
+    const label = (cam.label || "").toLowerCase();
+    let s = 0;
+    if (/back|rear/.test(label)) s += 10;
+    if (/front|user|selfie|facetime/.test(label)) s -= 20;
+    if (/ultra.?wide|wide angle|0\.5x/.test(label)) s -= 6;
+    if (/tele(photo)?|zoom/.test(label)) s -= 4;
+    if (/macro/.test(label)) s -= 6;
+    if (/depth|infrared|\bir\b/.test(label)) s -= 15;
+    return s;
+  };
+
+  return cameras
+    .map((cam, i) => ({ cam, i, s: score(cam) }))
+    .sort((a, b) => b.s - a.s || a.i - b.i)
+    .map((x) => x.cam);
+}
+
+/**
+ * Enumerates cameras exactly once per session — before the main stream
+ * opens, never after (calling getCameras() again while a stream is
+ * already live risks a second concurrent camera negotiation on the same
+ * hardware, itself a plausible cause of the corrupted-frame symptoms).
+ * Prefers whichever camera last actually decoded a QR code successfully
+ * (remembered in localStorage), falling back to the label-ranked guess.
+ */
+async function resolveStartCamera() {
+  let cameras = [];
+  try {
+    cameras = await Html5Qrcode.getCameras();
+  } catch (_) {
+    cameras = [];
+  }
+
+  state.cameras = rankCameras(cameras);
+
+  if (!state.cameras.length) {
+    state.cameraIndex = 0;
+    return null;
+  }
+
+  const savedId = localStorage.getItem("k5_camera_id");
+  let idx = 0;
+
+  if (savedId) {
+    const found = state.cameras.findIndex((c) => c.id === savedId);
+    if (found !== -1) idx = found;
+  }
+
+  state.cameraIndex = idx;
+  return state.cameras[idx].id;
+}
+
+async function startScanner(forcedCameraId) {
   // Prevent start/start race conditions.
   if (state.scannerRunning || state.scannerStarting) {
     return;
@@ -435,16 +569,29 @@ async function startScanner() {
       throw new Error("Scanner element was not found.");
     }
 
-    // Prefer rear/environment camera.
-    // html5-qrcode's own argument validation only accepts `facingMode` as
-    // either a plain string ("environment") or an object with just an
-    // `exact` key ({ exact: "environment" }) — it rejects any other shape,
-    // including the standard MediaTrackConstraints `{ ideal: "environment" }`
-    // form, with "'facingMode' should be string or object with exact as
-    // key." The plain string form below is what the library treats as a
-    // soft preference: it behaves like "ideal" (falls back to another
-    // camera if there's no rear camera) without forcing an exact match.
-    //
+    // Resolve which physical camera to use *before* opening the stream.
+    // A forced ID (passed in during automatic recovery) always wins;
+    // otherwise resolve fresh via getCameras() (see resolveStartCamera).
+    // If enumeration comes back empty for any reason, fall back to the
+    // plain facingMode preference exactly as before.
+    let cameraIdOrConfig = forcedCameraId || null;
+
+    if (!cameraIdOrConfig) {
+      cameraIdOrConfig = await resolveStartCamera();
+    }
+
+    if (!cameraIdOrConfig) {
+      // html5-qrcode's own argument validation only accepts `facingMode`
+      // as either a plain string ("environment") or an object with just
+      // an `exact` key — it rejects any other shape, including the
+      // standard MediaTrackConstraints `{ ideal: "environment" }` form,
+      // with "'facingMode' should be string or object with exact as
+      // key." The plain string form is what the library treats as a
+      // soft preference: falls back to another camera instead of forcing
+      // an exact (and possibly nonexistent) match.
+      cameraIdOrConfig = { facingMode: "environment" };
+    }
+
     // Keep a handle on this promise on `state` so any other function that
     // wants to stop/clear the scanner (closeScanner, stopScanner) can wait
     // for it to settle first instead of calling stop()/clear() while
@@ -452,16 +599,13 @@ async function startScanner() {
     // so is what throws "Cannot transition to a new state, already under
     // transition."
     //
-    // Note: no `aspectRatio` constraint here anymore. Forcing a
-    // non-native aspect ratio (like the previous 1:1) makes some Android
-    // camera pipelines hand back a corrupted/greenish frame. The video
-    // element is already forced to fill and crop to a square via CSS
-    // (`object-fit: cover`), so dropping this has no visual effect and
-    // removes a likely cause of the green-screen glitches.
+    // No `aspectRatio` constraint here — forcing a non-native aspect
+    // ratio (like a previous 1:1) makes some Android camera pipelines
+    // hand back a corrupted/greenish frame. The video element is already
+    // forced to fill and crop to a square via CSS (`object-fit: cover`),
+    // so dropping this has no visual effect.
     state.startPromise = state.scanner.start(
-      {
-        facingMode: "environment",
-      },
+      cameraIdOrConfig,
       {
         fps: 10,
 
@@ -488,20 +632,13 @@ async function startScanner() {
 
     // getUserMedia/start() resolving only means the camera negotiation
     // succeeded — on many Android devices the video element isn't
-    // actually painting real frames yet at this point, which is what
-    // produced the black-screen flash. Keep state.cameraReady false and
-    // the status overlay up until frames are confirmed.
+    // actually painting real (uncorrupted) frames yet at this point,
+    // which is what produced the black/green-screen flash. Keep
+    // state.cameraReady false and the status overlay up until frames are
+    // confirmed. Camera enumeration already happened above, before the
+    // stream opened — it is deliberately not repeated here.
     state.scannerRunning = true;
     state.cameraReady = false;
-
-    // Only now discover cameras.
-    try {
-      state.cameras = await Html5Qrcode.getCameras();
-    } catch (e) {
-      state.cameras = [];
-    }
-
-    updateCameraControls();
 
     await waitForCameraFrames();
     state.cameraReady = true;
@@ -645,6 +782,17 @@ async function onQrSuccess(decodedText) {
   state.qrProcessing = true;
 
   try {
+    // A real, successful decode is the strongest possible signal that
+    // the current camera is the right one — remember it so future
+    // sessions on this device/browser start directly on it instead of
+    // re-guessing via facingMode or label heuristics.
+    const activeCamera = state.cameras[state.cameraIndex];
+    if (activeCamera?.id) {
+      try {
+        localStorage.setItem("k5_camera_id", activeCamera.id);
+      } catch (_) {}
+    }
+
     await stopScanner();
     scannerModal.hide();
 
@@ -1042,110 +1190,64 @@ function showHistory() {
   new bootstrap.Modal($("historyModal")).show();
 }
 
-async function switchCamera() {
-  if (state.cameras.length < 2) {
-    await Swal.fire({
-      icon: "info",
-      title: "Only One Camera",
-      text: "No alternate camera was detected.",
-    });
-
-    return;
-  }
-
-  if (state.scannerStarting || state.scannerStopping || !state.scannerRunning) {
-    return;
-  }
-
-  try {
-    state.scannerStopping = true;
-    stopFreezeWatchdog();
-    state.cameraReady = false;
-    showScannerStatus("Switching camera…");
-
-    await state.scanner.stop();
-
-    state.scannerRunning = false;
-    state.scannerStopping = false;
-
-    state.cameraIndex = (state.cameraIndex + 1) % state.cameras.length;
-
-    await new Promise((resolve) => setTimeout(resolve, 250));
-
-    state.scannerStarting = true;
-
-    // No `aspectRatio` here either — see the matching note in
-    // startScanner() for why forcing one caused corrupted/green frames on
-    // some devices. The video element is still cropped to a square
-    // visually via CSS regardless.
-    await state.scanner.start(
-      state.cameras[state.cameraIndex].id,
-      {
-        fps: 10,
-
-        qrbox: (viewfinderWidth, viewfinderHeight) => {
-          const size = Math.floor(
-            Math.min(viewfinderWidth, viewfinderHeight) * 0.7,
-          );
-
-          return {
-            width: size,
-            height: size,
-          };
-        },
-      },
-
-      onQrSuccess,
-
-      () => {},
-    );
-
-    state.scannerRunning = true;
-
-    await waitForCameraFrames();
-    state.cameraReady = true;
-    hideScannerStatus();
-    startFreezeWatchdog();
-  } catch (err) {
-    console.error("Camera switch error:", err);
-
-    state.scannerRunning = false;
-    state.cameraReady = false;
-    hideScannerStatus();
-
-    await Swal.fire({
-      icon: "error",
-      title: "Camera Error",
-      text: friendlyCameraError(err),
-    });
-  } finally {
-    state.scannerStarting = false;
-    state.scannerStopping = false;
-  }
-}
-
 async function toggleTorch() {
   if (!state.scanner || !state.scannerRunning) return;
+
+  const desired = !state.torchOn;
+
   try {
-    state.torchOn = !state.torchOn;
+    // Check the running track's actual capabilities first rather than
+    // just firing the constraint and hoping. Some browsers accept an
+    // unsupported "advanced" constraint without ever throwing — silently
+    // doing nothing — which is exactly what made this look like it
+    // "wasn't working" with no visible error before this fix.
+    let capabilities = {};
+    try {
+      capabilities = state.scanner.getRunningTrackCapabilities() || {};
+    } catch (_) {
+      capabilities = {};
+    }
+
+    if (!("torch" in capabilities)) {
+      await Swal.fire({
+        icon: "info",
+        title: "Flash Unavailable",
+        text: "This camera does not report flash/torch support.",
+      });
+      return;
+    }
+
     await state.scanner.applyVideoConstraints({
-      advanced: [{ torch: state.torchOn }],
+      advanced: [{ torch: desired }],
     });
+
+    // Verify the constraint actually took effect — some devices accept
+    // it without error but don't actually toggle the hardware.
+    let settings = {};
+    try {
+      settings = state.scanner.getRunningTrackSettings() || {};
+    } catch (_) {
+      settings = {};
+    }
+
+    if (settings.torch !== desired) {
+      throw new Error("Torch constraint did not apply.");
+    }
+
+    state.torchOn = desired;
     $("torchMainBtn").innerHTML = state.torchOn
       ? '<i class="bi bi-lightning-fill"></i> Flash On'
       : '<i class="bi bi-lightning-charge"></i> Flash';
   } catch (_) {
-    Swal.fire({
+    // Leave state.torchOn as it was — the toggle never actually took
+    // effect, so don't let the app's idea of the flash state drift from
+    // reality.
+    await Swal.fire({
       icon: "info",
       title: "Flash Unavailable",
-      text: "Your browser or camera does not expose flash control.",
+      text: "Your browser or camera does not support flash control.",
     });
   }
-}
-
-function updateCameraControls() {
-  const switchBtn = $("switchCameraBtn");
-  switchBtn.style.visibility = state.cameras.length > 1 ? "visible" : "hidden";
 }
 
 async function api(action, payload = {}) {
